@@ -1,0 +1,88 @@
+# VR-DINO Configuration
+
+# Experimental Configurations
+experiments:
+  vanilla:
+    name: "Vanilla DINO"
+    use_kd: false
+    use_weighting: false
+    weight_mode: "uniform"
+    description: "Baseline: Equal weights for all views, no KD"
+  
+  ce_only:
+    name: "CE-only (No KD)"
+    use_kd: false
+    use_weighting: false
+    weight_mode: "uniform"
+    description: "Baseline: Only cross-entropy, no knowledge distillation"
+  
+  random:
+    name: "Random Weighting"
+    use_kd: true
+    use_weighting: true
+    weight_mode: "random"
+    description: "Ablation: Random weights to verify VR-KD isn't just noise"
+  
+  vr_dino:
+    name: "VR-DINO (Proposed)"
+    use_kd: true
+    use_weighting: true
+    weight_mode: "reliability"
+    description: "Proposed: Confidence-based reliability weighting"
+
+# Training Hyperparameters
+training:
+  learning_rate: 5e-4
+  batch_size: 128
+  epochs: 200
+  warmup_epochs: 10
+  weight_decay: 0.05
+  gradient_clip: 1.0
+
+# Knowledge Distillation Parameters
+distillation:
+  temperature: 0.4
+  alpha: 0.5
+  min_weight: 0.1
+  kd_weight: 0.5
+
+# Multi-crop Configuration
+augmentation:
+  global_views: 2
+  global_size: 224
+  local_views: 8
+  local_size: 96
+  color_jitter: 0.4
+  grayscale_prob: 0.2
+
+# Data Configuration
+data:
+  dataset: "cifar100"
+  data_dir: "./data"
+  num_classes: 100
+  train_val_split: 0.8
+  num_workers: 4
+  pin_memory: true
+
+# Model Configuration
+model:
+  teacher:
+    arch: "dino_vits16"
+    frozen: true
+  student:
+    arch: "vit_tiny_patch16_224"
+    num_classes: 100
+    pretrained: false
+
+# Logging and Checkpointing
+logging:
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
+  save_interval: 10
+  verbose_interval: 5
+
+# Device Configuration
+device:
+  use_cuda: true
+  use_mixed_precision: false
+  cudnn_benchmark: true
