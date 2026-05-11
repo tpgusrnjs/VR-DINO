@@ -30,7 +30,7 @@ class MultiCropTransform:
         
         self.local_transform = transforms.Compose([
             transforms.RandomResizedCrop(
-                96,
+                224,
                 scale=(0.05, 0.4),
                 interpolation=transforms.InterpolationMode.BICUBIC
             ),
@@ -77,7 +77,7 @@ class StandardTransform:
         return self.transform(image)
 
 
-def get_cifar100_loaders(batch_size=128, num_workers=4, num_train=0.8):
+def get_cifar100_loaders(batch_size=32, num_workers=4, num_train=0.8):
     """Get CIFAR-100 train/val/test loaders"""
     
     train_transform = MultiCropTransform()

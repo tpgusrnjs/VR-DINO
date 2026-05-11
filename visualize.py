@@ -176,6 +176,24 @@ class MetricsVisualizer:
         plt.close()
     
     @staticmethod
+    def plot_loss_comparison(loss_histories, output_dir='./visualizations'):
+        """Plot training loss curves over multiple experiment configurations."""
+        Path(output_dir).mkdir(exist_ok=True)
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for method, losses in loss_histories.items():
+            ax.plot(losses, label=method.replace('_', ' ').title(), linewidth=2)
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Training Loss')
+        ax.set_title('Training Loss Comparison')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/loss_comparison.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    @staticmethod
     def plot_reliability_distribution(reliabilities, output_path='reliability_dist.png'):
         """Plot distribution of reliability scores"""
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))

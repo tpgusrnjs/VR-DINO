@@ -14,7 +14,7 @@ class ExperimentConfig:
     use_weighting: bool = True
     weight_mode: str = "reliability"  # reliability, random, uniform
     learning_rate: float = 5e-4
-    batch_size: int = 128
+    batch_size: int = 64
     epochs: int = 200
     temperature: float = 0.4
     alpha: float = 0.5
@@ -126,6 +126,11 @@ def init_weights(model):
                 torch.nn.init.constant_(m.bias, 0)
         elif isinstance(m, torch.nn.Conv2d):
             torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+
+def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+    """Wrapper for torch truncated normal initialization."""
+    return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
 
 
 def clip_weights(weights, min_val=0.1, max_val=1.0):
