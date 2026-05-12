@@ -118,7 +118,8 @@ def get_cifar100_loaders(batch_size=32, num_workers=4, num_train=0.8):
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     test_loader = DataLoader(
@@ -126,7 +127,8 @@ def get_cifar100_loaders(batch_size=32, num_workers=4, num_train=0.8):
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     return train_loader, val_loader, test_loader

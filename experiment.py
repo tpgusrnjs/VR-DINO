@@ -35,13 +35,20 @@ CONFIGURATION COMPARISON:
 """
 
 import torch
+
+# Runtime optimization
+torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision('high')
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import argparse
 from pathlib import Path
 import json
 from datetime import datetime
 from tqdm import tqdm
-import torch.cuda.amp as amp
-import torch.amp
+from torch.amp import GradScaler, autocast
 
 from models import build_teacher, build_student
 from losses import CombinedLoss
@@ -53,35 +60,34 @@ from utils import (
 from ablation import generate_ablation_report
 from visualize import DINoAttentionVisualizer, MetricsVisualizer, PredictionVisualizer
 
+def forward_views_mean(model, views):
+    """
+    기존 loop + stack + mean을 완전히 동일하게 재현
+    views: [B, V, C, H, W]
+    return: [B, num_classes]
+    """
+    B, V, C, H, W = views.shape
+    
+    views = views.reshape(B * V, C, H, W)
+    logits = model(views)                 # [B*V, C]
+    logits = logits.reshape(B, V, -1)        # [B, V, C]
+    
+    return logits.mean(dim=1)
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, teacher, data_loader, epoch, total_epochs, device, weight_mode='reliability'):
     """Evaluate model on dataset"""
     model.eval()
-    teacher.eval()
     
     acc1_total = 0.0
     acc5_total = 0.0
     total = 0
     
-    criterion = CombinedLoss()
-    epoch_ratio = epoch / total_epochs if total_epochs > 0 else 1.0
-    
-    for (global_views, local_views), labels in data_loader:
-        global_views = global_views.to(device)
-        local_views = local_views.to(device)
-        labels = labels.to(device)
+    for (_, local_views), labels in data_loader:
+        local_views = local_views.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
-        teacher_global = teacher(global_views.mean(dim=1))
-        teacher_local_list = []
-        for i in range(local_views.size(1)):
-            teacher_local_list.append(teacher(local_views[:, i]))
-        teacher_local = torch.stack(teacher_local_list, dim=1).mean(dim=1)
-        
-        student_logits = []
-        for i in range(local_views.size(1)):
-            student_logits.append(model(local_views[:, i]))
-        student_logits = torch.stack(student_logits, dim=1).mean(dim=1)
+        student_logits = forward_views_mean(model, local_views)
         
         acc1, acc5 = accuracy(student_logits, labels, topk=(1, 5))
         
@@ -104,6 +110,11 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
     # Models
     teacher = build_teacher(num_classes=100).to(device)
     student = build_student(num_classes=100).to(device)
+
+    teacher.eval()
+
+    for p in teacher.parameters():
+        p.requires_grad = False
     
     criterion = CombinedLoss(
         kd_weight=0.5 if config.use_kd else 0.0,
@@ -116,11 +127,17 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
         lr=config.learning_rate,
         weight_decay=0.05
     )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=1e-6
+    )
     
     # Data
     train_loader, val_loader, test_loader = get_cifar100_loaders(
         batch_size=config.batch_size,
-        num_workers=min(8, torch.cuda.device_count() * 2) if torch.cuda.is_available() else 2
+        num_workers=4
     )
     
     loss_meter = AverageMeter()
@@ -133,37 +150,33 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
     result_path = checkpoint_dir / 'results.json'
     
     # Mixed precision training
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = GradScaler()
     
+    start_epoch = 0
+
     if checkpoint_path.exists():
-        print(f"\nFound existing checkpoint for '{config_name}' at {checkpoint_path}. Skipping training.")
-        start_epoch = load_checkpoint(str(checkpoint_path), student)
-        if result_path.exists():
-            with open(result_path, 'r') as f:
-                saved_result = json.load(f)
-            saved_result['checkpoint'] = str(checkpoint_path)
-            return saved_result
-        else:
-            # Evaluate if saved result is missing
-            test_acc1, test_acc5 = evaluate(student, teacher, test_loader, epochs-1, epochs, device, config.weight_mode)
-            return {
-                'name': config.name,
-                'val_acc': best_acc,
-                'test_acc@1': test_acc1,
-                'test_acc@5': test_acc5,
-                'checkpoint': str(checkpoint_path),
-                'history': {
-                    'train_loss': train_loss_history,
-                    'val_accuracy': val_accuracy_history
-                }
-            }
-    
+        print(f"Loading checkpoint: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        student.load_state_dict(checkpoint['model_state_dict'])
+
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        best_acc = checkpoint.get('best_acc', 0)
+
+        train_loss_history = checkpoint.get('train_loss_history', [])
+        val_accuracy_history = checkpoint.get('val_accuracy_history', [])
+
     print(f"\n{'='*60}")
     print(f"Training: {config.name}")
     print(f"Weight Mode: {config.weight_mode}")
     print(f"{'='*60}\n")
     
-    for epoch in range(epochs):
+    
+    for epoch in range(start_epoch, epochs):
         student.train()
         loss_meter.reset()
         epoch_ratio = epoch / max(epochs, 1)
@@ -176,30 +189,24 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
         )
         
         for (global_views, local_views), labels in train_iter:
-            global_views = global_views.to(device)
-            local_views = local_views.to(device)
-            labels = labels.to(device)
+            global_views = global_views.to(device, non_blocking=True)
+            local_views = local_views.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
             with torch.no_grad():
-                teacher_global = teacher(global_views.mean(dim=1))
-                teacher_local_list = []
-                for i in range(local_views.size(1)):
-                    teacher_local_list.append(teacher(local_views[:, i]))
-                teacher_local = torch.stack(teacher_local_list, dim=1).mean(dim=1)
+                teacher_global = forward_views_mean(teacher, global_views)
+                teacher_local = forward_views_mean(teacher, local_views)
             
             # Mixed precision forward pass
-            with torch.amp.autocast('cuda'):
-                student_logits = []
-                for i in range(local_views.size(1)):
-                    student_logits.append(student(local_views[:, i]))
-                student_logits = torch.stack(student_logits, dim=1).mean(dim=1)
+            with autocast(device_type="cuda"):
+                student_logits = forward_views_mean(student, local_views)
                 
                 loss, _ = criterion(
                     student_logits, teacher_global, teacher_local,
                     labels, epoch_ratio, weight_mode=config.weight_mode
                 )
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             # Mixed precision backward pass
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -215,20 +222,34 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
                 loss=f"{loss_meter.avg:.4f}",
                 val=val_display
             )
-        
+            
+        scheduler.step()
+
         train_loss_history.append(loss_meter.avg)
         val_acc1, val_acc5 = evaluate(student, teacher, val_loader, epoch, epochs, device, config.weight_mode)
         val_accuracy_history.append(val_acc1)
         
-        if val_acc1 > best_acc:
+        if val_acc1 >= best_acc:
             best_acc = val_acc1
-            save_checkpoint({'model_state_dict': student.state_dict()}, str(checkpoint_path))
+            save_checkpoint(
+                {
+                    'epoch': epoch,
+                    'model_state_dict': student.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_acc': best_acc,
+                    'train_loss_history': train_loss_history,
+                    'val_accuracy_history': val_accuracy_history
+                },
+                str(checkpoint_path)
+            )
         
         if (epoch + 1) % 20 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch+1}/{epochs}: Train Loss={loss_meter.avg:.4f}, Val Acc={val_acc1:.2f}%")
-    
+
+        torch.cuda.empty_cache()
+
     # Test
-    torch.cuda.empty_cache()
+    student = build_student(num_classes=100).to(device)
     load_checkpoint(str(checkpoint_path), student)
     test_acc1, test_acc5 = evaluate(student, teacher, test_loader, epochs-1, epochs, device, config.weight_mode)
     
@@ -257,15 +278,12 @@ def collect_model_predictions(student, test_loader, device):
     all_labels = []
     all_images = []
     
-    with torch.no_grad():
+    with torch.inference_mode() :
         for (global_views, local_views), labels in test_loader:
-            global_views = global_views.to(device)
-            local_views = local_views.to(device)
+            global_views = global_views.to(device, non_blocking=True)
+            local_views = local_views.to(device, non_blocking=True)
             
-            student_logits = []
-            for i in range(local_views.size(1)):
-                student_logits.append(student(local_views[:, i]))
-            student_logits = torch.stack(student_logits, dim=1).mean(dim=1)
+            student_logits = forward_views_mean(student, local_views)
             
             all_predictions.append(student_logits.cpu())
             all_labels.append(labels.cpu())
@@ -284,7 +302,9 @@ def generate_visualizations(config_name, checkpoint_path, output_dir='./results'
     
     teacher = build_teacher(num_classes=100).to(device)
     student = build_student(num_classes=100).to(device)
-    student.load_state_dict(torch.load(checkpoint_path)['model_state_dict'])
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    student.load_state_dict(checkpoint['model_state_dict'])
     student.eval()
     
     _, _, test_loader = get_cifar100_loaders(batch_size=64, num_workers=4)
@@ -299,7 +319,10 @@ def generate_visualizations(config_name, checkpoint_path, output_dir='./results'
             output_path=str(viz_dir / f'attention_map_{i}.png')
         )
     visualizer.remove_hooks()
-    
+
+    del visualizer
+    torch.cuda.empty_cache()
+
     print("  Generating confusion matrix...")
     PredictionVisualizer.confusion_matrix(
         all_predictions, all_labels, num_classes=100,
@@ -313,6 +336,10 @@ def generate_visualizations(config_name, checkpoint_path, output_dir='./results'
         num_samples=16,
         output_path=str(viz_dir / 'predictions.png')
     )
+
+    del teacher
+    del student
+    torch.cuda.empty_cache()
 
 
 def run_all_experiments(output_dir='./results', epochs=200):
