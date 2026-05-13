@@ -19,6 +19,7 @@ class ExperimentConfig:
     temperature: float = 0.4
     alpha: float = 0.5
     min_weight: float = 0.1
+    teacher_momentum: float = 0.996
     warmup_epochs: int = 10
     
     def save(self, path):

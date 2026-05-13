@@ -60,19 +60,19 @@ from utils import (
 from ablation import generate_ablation_report
 from visualize import DINoAttentionVisualizer, MetricsVisualizer, PredictionVisualizer
 
-def forward_views_mean(model, views):
-    """
-    기존 loop + stack + mean을 완전히 동일하게 재현
-    views: [B, V, C, H, W]
-    return: [B, num_classes]
-    """
+def forward_view_logits(model, views):
+    """Forward a batch of multi-crop views through a model."""
     B, V, C, H, W = views.shape
-    
     views = views.reshape(B * V, C, H, W)
-    logits = model(views)                 # [B*V, C]
-    logits = logits.reshape(B, V, -1)        # [B, V, C]
-    
+    logits = model(views)
+    return logits.reshape(B, V, -1)
+
+
+def forward_views_mean(model, views):
+    """Mean logits across multiple views for evaluation."""
+    logits = forward_view_logits(model, views)
     return logits.mean(dim=1)
+
 
 @torch.inference_mode()
 def evaluate(model, teacher, data_loader, epoch, total_epochs, device, weight_mode='reliability'):
@@ -108,20 +108,20 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
     config = configs[config_name]
     
     # Models
-    teacher = build_teacher(num_classes=100).to(device)
     student = build_student(num_classes=100).to(device)
-
+    teacher = build_teacher(num_classes=100).to(device)
+    teacher.load_state_dict(student.state_dict())
     teacher.eval()
 
     for p in teacher.parameters():
         p.requires_grad = False
-    
+
     criterion = CombinedLoss(
         kd_weight=0.5 if config.use_kd else 0.0,
         temperature=config.temperature,
         alpha=config.alpha
     )
-    
+
     optimizer = torch.optim.AdamW(
         student.parameters(),
         lr=config.learning_rate,
@@ -160,9 +160,13 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
         student.load_state_dict(checkpoint['model_state_dict'])
+        teacher.load_state_dict(checkpoint.get('teacher_state_dict', student.state_dict()))
 
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if 'kd_center' in checkpoint and hasattr(criterion.kd_loss, 'center'):
+            criterion.kd_loss.center = checkpoint['kd_center']
 
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_acc = checkpoint.get('best_acc', 0)
@@ -180,6 +184,7 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
         student.train()
         loss_meter.reset()
         epoch_ratio = epoch / max(epochs, 1)
+        teacher_momentum = config.teacher_momentum + (1.0 - config.teacher_momentum) * min(epoch_ratio, 1.0)
         
         train_iter = tqdm(
             train_loader,
@@ -193,13 +198,16 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
             local_views = local_views.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             
-            with torch.no_grad():
-                teacher_global = forward_views_mean(teacher, global_views)
-                teacher_local = forward_views_mean(teacher, local_views)
+            teacher_global = None
+            teacher_local = None
+            if config.use_kd:
+                with torch.no_grad():
+                    teacher_global = forward_view_logits(teacher, global_views)
+                    teacher_local = forward_view_logits(teacher, local_views)
             
             # Mixed precision forward pass
             with autocast(device_type="cuda"):
-                student_logits = forward_views_mean(student, local_views)
+                student_logits = forward_view_logits(student, local_views)
                 
                 loss, _ = criterion(
                     student_logits, teacher_global, teacher_local,
@@ -213,6 +221,9 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+
+            if config.use_kd:
+                teacher.update_ema(student, momentum=teacher_momentum)
             
             loss_meter.update(loss.item(), n=labels.size(0))
             
@@ -235,10 +246,12 @@ def run_single_experiment(config_name, checkpoint_dir='./checkpoints', epochs=10
                 {
                     'epoch': epoch,
                     'model_state_dict': student.state_dict(),
+                    'teacher_state_dict': teacher.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'best_acc': best_acc,
                     'train_loss_history': train_loss_history,
-                    'val_accuracy_history': val_accuracy_history
+                    'val_accuracy_history': val_accuracy_history,
+                    'kd_center': getattr(criterion.kd_loss, 'center', None)
                 },
                 str(checkpoint_path)
             )
@@ -305,7 +318,9 @@ def generate_visualizations(config_name, checkpoint_path, output_dir='./results'
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     student.load_state_dict(checkpoint['model_state_dict'])
+    teacher.load_state_dict(checkpoint.get('teacher_state_dict', teacher.state_dict()))
     student.eval()
+    teacher.eval()
     
     _, _, test_loader = get_cifar100_loaders(batch_size=64, num_workers=4)
     all_predictions, all_labels, all_images = collect_model_predictions(student, test_loader, device)
